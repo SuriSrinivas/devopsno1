@@ -1,36 +1,117 @@
-# This is a basic workflow to help you get started with Actions
+name: Advanced CI/CD Pipeline
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: ["main", "dev"]  # Triggers on push to main/dev
   pull_request:
-    branches: [ "main" ]
+    branches: ["*"]           # Runs on all PRs
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+env:
+  NODE_VERSION: "20"          # Example (adjust for your stack)
+  DOCKER_IMAGE: "my-app"      # Replace with your Docker image name
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  # --- LINTING & CODE QUALITY ---
+  lint:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      - run: npm ci
+      - run: npm run lint       # ESLint, Prettier, etc.
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+  # --- UNIT TESTS (Parallelized) ---
+  test:
+    needs: lint                # Depends on lint passing first
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]  # Test on multiple OSes
+        node-version: ["18", "20"]         # Test on multiple Node versions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test -- --coverage  # Runs Jest/Mocha with coverage
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+  # --- BUILD ARTIFACTS (Docker + Frontend) ---
+  build:
+    needs: test                # Depends on tests passing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Build Docker image (if applicable)
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.DOCKER_IMAGE }}:latest
+
+      # Build frontend (e.g., React, Vue)
+      - name: Build frontend
+        run: npm run build
+
+      # Upload build artifacts (for deployment)
+      - uses: actions/upload-artifact@v3
+        with:
+          name: build-output
+          path: |
+            dist/              # Frontend build
+            Dockerfile         # Docker artifacts
+
+  # --- DEPLOYMENTS (Staging + Production) ---
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging      # Requires GitHub environment setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v3
+        with:
+          name: build-output
+      - run: echo "Deploying to staging..."
+      # Example: Vercel/AWS CLI commands
+      # - run: aws s3 sync dist/ s3://staging-bucket
+
+  deploy-prod:
+    needs: deploy-staging     # Deploy to prod only after staging succeeds
+    if: github.ref == 'refs/heads/main'  # Only deploy from main branch
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: build-output
+      - run: echo "Deploying to production..."
+      # - run: aws s3 sync dist/ s3://prod-bucket
+
+  # --- NOTIFICATIONS ---
+  notify:
+    needs: [deploy-staging, deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack Success Notification
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          slack-message: "✅ Pipeline succeeded! ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+      - name: Slack Failure Notification
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          slack-message: "❌ Pipeline failed! Check ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
